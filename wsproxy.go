@@ -1,6 +1,7 @@
 package wsproxy
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -12,10 +13,33 @@ import (
 
 var (
 	DEBUG = false
+
+	sErrOpenOverLimit = "Too many opened connection"
+	errOpenLimitValue = errors.New("Valid limit value must is limit >= 0")
 )
 
-func Handler(path, sockServer string) http.HandlerFunc {
+func Handler(path, sockServer string, openLimit int) http.HandlerFunc {
+	if openLimit < 0 {
+		panic(errOpenLimitValue)
+	}
+	var lck struct {
+		sync.Mutex
+		cnt int
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Open limit checking
+		// Increment number of connection
+		lck.Lock()
+		if lck.cnt >= openLimit {
+			lck.Unlock()
+			http.Error(w, sErrOpenOverLimit, http.StatusTooManyRequests)
+			return
+		}
+		lck.cnt++
+		lck.Unlock()
+
+		// Debug message
 		if DEBUG {
 			fmt.Println("Incoming websocket request from:", r.RemoteAddr)
 			fmt.Println("URI:", r.RequestURI)
@@ -24,6 +48,7 @@ func Handler(path, sockServer string) http.HandlerFunc {
 			//fmt.Println("Query:", r.URL.RawQuery)
 		}
 
+		// Upgrade standard HTTP connection into websocket
 		upgrader := websocket.Upgrader{}
 		wsClient, e := upgrader.Upgrade(w, r, nil)
 		if e != nil {
@@ -33,6 +58,7 @@ func Handler(path, sockServer string) http.HandlerFunc {
 		}
 		defer wsClient.Close()
 
+		// Connect to websocket server
 		wsServer, e := wsConnect("ws", sockServer, r.URL.Path[len(path):], r.URL.RawQuery)
 		if e != nil {
 			fmt.Println("Connect error")
@@ -41,11 +67,18 @@ func Handler(path, sockServer string) http.HandlerFunc {
 		}
 		defer wsServer.Close()
 
+		// Proxy between server and client
 		wg := new(sync.WaitGroup)
 		wg.Add(2)
 		go wsProxy(wsClient, wsServer, wg)
 		go wsProxy(wsServer, wsClient, wg)
 		wg.Wait()
+
+		// Open limit checking
+		// Decrement number of connection
+		lck.Lock()
+		lck.cnt--
+		lck.Unlock()
 	})
 }
 
